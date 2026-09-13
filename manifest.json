@@ -3,15 +3,24 @@
   "name": "Netflix Subtitle Downloader",
   "description": "Download subtitles from Netflix as WebVTT or DFXP files, packaged in a ZIP.",
   "version": "1.0.0",
-  "permissions": ["storage", "activeTab"],
-  "host_permissions": ["https://www.netflix.com/*"],
+  "permissions": ["storage", "activeTab", "scripting", "downloads"],
+  "host_permissions": ["*://*.netflix.com/*", "*://netflix.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "icons": {
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.netflix.com/*"],
+      "matches": ["*://*.netflix.com/*", "*://netflix.com/*"],
+      "js": ["inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://*.netflix.com/*", "*://netflix.com/*"],
       "js": ["lib/jszip.min.js", "lib/FileSaver.min.js", "epub.js", "content.js"],
       "run_at": "document_start"
     }
@@ -26,7 +35,7 @@
   "web_accessible_resources": [
     {
       "resources": ["inject.js"],
-      "matches": ["https://www.netflix.com/*"]
+      "matches": ["*://*.netflix.com/*", "*://netflix.com/*"]
     }
   ]
 }

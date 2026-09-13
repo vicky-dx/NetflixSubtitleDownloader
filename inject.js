@@ -2,6 +2,11 @@
 // intercept JSON.parse / JSON.stringify / fetch / XHR used by Netflix.
 
 (function (ALL_FORMATS) {
+  if (window.__NSD_INJECTED__) return;
+  window.__NSD_INJECTED__ = true;
+
+  console.log('[NSD] Netflix Subtitle Downloader injector active');
+
   const MANIFEST_PATTERN = /manifest|licensedManifest/;
 
   const getStorage = (key, fallback) => {
@@ -17,21 +22,61 @@
     }));
   });
 
-  // Hijack JSON.parse, JSON.stringify, XHR open, and fetch
+  function inspectCandidate(data, source) {
+    if (!data || typeof data !== 'object') return;
+
+    // Check for subtitle manifest tracks
+    const candidates = [data, data.result, data.data, data.value].filter(Boolean);
+    for (const c of candidates) {
+      if (typeof c !== 'object') continue;
+      const tracks = c.timedtexttracks || c.textTracks || c.timedTextTracks;
+      if (tracks && (Array.isArray(tracks) || typeof tracks === 'object')) {
+        const trackList = Array.isArray(tracks) ? tracks : Object.values(tracks);
+        const hasDownloadables = trackList.some(t => t && (t.ttDownloadables || t.downloadables));
+        if (!hasDownloadables) continue;
+
+        const urlId = (window.location.pathname.match(/\/watch\/(\d+)/) || [])[1];
+        if (!c.movieId && urlId) {
+          c.movieId = parseInt(urlId, 10);
+        }
+        console.log('[NSD] Intercepted valid subtitles from:', source, 'track count:', trackList.length);
+        window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+          detail: { type: 'subs', data: c }
+        }));
+        break;
+      }
+    }
+
+    // Check for metadata
+    if (data.video && (data.video.type === 'show' || data.video.type === 'movie' || data.video.seasons)) {
+      console.log('[NSD] Intercepted metadata from:', source, data.video.title);
+      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
+        detail: { type: 'metadata', data }
+      }));
+    }
+  }
+
+  // Hijack JSON.parse, JSON.stringify, Response.prototype.json, fetch, and XHR
   const origParse = JSON.parse;
   const origStringify = JSON.stringify;
   const origOpen = XMLHttpRequest.prototype.open;
+  const origSend = XMLHttpRequest.prototype.send;
   const origFetch = window.fetch;
 
   JSON.parse = function (text) {
     const data = origParse(text);
-    if (data && data.result && data.result.timedtexttracks && data.result.movieId) {
-      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
-        detail: { type: 'subs', data: data.result }
-      }));
-    }
+    try { inspectCandidate(data, 'JSON.parse'); } catch (_) {}
     return data;
   };
+
+  if (window.Response && Response.prototype.json) {
+    const origResponseJson = Response.prototype.json;
+    Response.prototype.json = async function () {
+      const data = await origResponseJson.apply(this, arguments);
+      try { inspectCandidate(data, 'Response.json'); } catch (_) {}
+      return data;
+    };
+  }
 
   JSON.stringify = function (data) {
     if (data && typeof data.url === 'string' && data.url.search(MANIFEST_PATTERN) > -1) {
@@ -53,10 +98,10 @@
         }
       }
     }
-    if (data && typeof data.movieId === 'number') {
+    if (data && (typeof data.movieId === 'number' || typeof data.movieId === 'string')) {
       try {
-        const videoId = data.params.sessionParams.uiplaycontext.video_id;
-        if (typeof videoId === 'number' && videoId !== data.movieId)
+        const videoId = data.params?.sessionParams?.uiplaycontext?.video_id;
+        if (videoId && videoId !== data.movieId)
           window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
             detail: { type: 'id_override', data: [videoId, data.movieId] }
           }));
@@ -65,45 +110,50 @@
     return origStringify(data);
   };
 
-  XMLHttpRequest.prototype.open = function () {
-    if (arguments[1] && arguments[1].includes('/metadata?')) {
-      this.addEventListener('load', async function () {
-        let d = this.response;
-        if (d instanceof Blob) d = JSON.parse(await d.text());
-        else if (typeof d === 'string') d = JSON.parse(d);
-        window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
-          detail: { type: 'metadata', data: d }
-        }));
-      }, false);
-    }
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__nsd_url = typeof url === 'string' ? url : '';
     origOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function () {
+    this.addEventListener('load', function () {
+      try {
+        let d = this.response;
+        if (typeof d === 'string') {
+          try { d = origParse(d); } catch (_) {}
+        }
+        inspectCandidate(d, 'XHR');
+      } catch (_) {}
+    }, false);
+    origSend.apply(this, arguments);
   };
 
   window.fetch = async (...args) => {
     const response = origFetch(...args);
-    if (args[0] && typeof args[0] === 'string' && args[0].includes('/metadata?')) {
-      const copied = (await response).clone();
-      const data = await copied.json();
-      window.dispatchEvent(new CustomEvent('netflix_sub_downloader_data', {
-        detail: { type: 'metadata', data: data }
-      }));
-    }
+    try {
+      const rawUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+      if (rawUrl.includes('/metadata?') || rawUrl.includes('manifest') || rawUrl.includes('licensedManifest')) {
+        const copied = (await response).clone();
+        copied.json().then(data => {
+          inspectCandidate(data, 'fetch');
+        }).catch(() => {});
+      }
+    } catch (_) {}
     return response;
   };
 
   // Extract boxart URL from Falcor cache (portrait poster for book covers)
   const extractBoxart = () => {
     try {
-      const videoId = window.location.pathname.split('/').pop();
+      const m = window.location.pathname.match(/\/watch\/(\d+)/);
+      const videoId = m ? m[1] : window.location.pathname.split('/').filter(Boolean).pop();
       const cache = window.netflix && window.netflix.falcorCache;
       if (!cache || !cache.videos || !cache.videos[videoId]) return;
       const video = cache.videos[videoId];
-      // Look for boxart entries — Netflix stores them at various sizes like _342x684, _400x566
       const boxartKeys = Object.keys(video).filter(k => k.startsWith('boxart'));
       for (const key of boxartKeys) {
         const entries = video[key];
         if (!entries) continue;
-        // entries might have size keys like _342x684
         for (const sizeKey of Object.keys(entries)) {
           const val = entries[sizeKey];
           if (val && val.value && val.value.url) {
@@ -116,7 +166,6 @@
       }
     } catch (_) {}
   };
-  // Run after a delay to let Falcor cache populate
   setTimeout(extractBoxart, 3000);
   setTimeout(extractBoxart, 8000);
 

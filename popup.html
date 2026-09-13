@@ -5,7 +5,7 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 300px;
+      width: 330px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       font-size: 13px;
       background: #141414;
@@ -38,6 +38,10 @@
       padding: 4px 8px;
       font-size: 12px;
       width: 120px;
+    }
+    select.lang-select {
+      width: 180px;
+      text-overflow: ellipsis;
     }
     button {
       width: 100%;
@@ -92,11 +96,17 @@
   <div class="header">Netflix Subtitle Downloader</div>
 
   <div class="section">
-    <button id="btn-download">Download subs for this episode/movie</button>
-    <button id="btn-season" style="margin-top:6px">Download for this season</button>
-    <button id="btn-all" style="margin-top:6px">Download for all seasons</button>
-    <button id="btn-epub-season" style="margin-top:10px; background:#1a8fe3">Download EPUB (this season)...</button>
-    <button id="btn-epub-all" style="margin-top:6px; background:#1a8fe3">Download EPUB (all seasons)...</button>
+    <button id="btn-download" disabled>Download subs for this episode/movie</button>
+    <button id="btn-dual" style="margin-top:6px; background:#107c41" disabled>Download Dual Subs (.srt)</button>
+    <button id="btn-epub-single" style="margin-top:6px; background:#1a8fe3" disabled>Download as EPUB...</button>
+    <div id="series-actions">
+      <button id="btn-season" style="margin-top:6px" disabled>Download for this season</button>
+      <button id="btn-all" style="margin-top:6px" disabled>Download for all seasons</button>
+      <button id="btn-epub-season" style="margin-top:10px; background:#1a8fe3" disabled>Download EPUB (this season)...</button>
+      <button id="btn-epub-all" style="margin-top:6px; background:#1a8fe3" disabled>Download EPUB (all seasons)...</button>
+    </div>
+    <button id="btn-reload" style="margin-top:10px; background:#333; border: 1px solid #555; display:none;">🔄 Reload Netflix Tab</button>
+    <button id="btn-stop-batch" style="margin-top:6px; background:#b20710; display:none;">⏹️ Stop Active Batch</button>
   </div>
 
   <div class="section">
@@ -123,7 +133,7 @@
 
     <label>
       <span>Languages to download</span>
-      <input type="text" id="opt-langs" placeholder="all (e.g. en,ja,ko)">
+      <input type="text" id="opt-langs" placeholder="all (e.g. en, de)">
     </label>
 
     <label>
@@ -141,16 +151,20 @@
   </div>
 
   <div class="section">
-    <div style="font-size:12px; color:#999; margin-bottom:6px">EPUB defaults</div>
+    <div style="font-size:12px; color:#999; margin-bottom:6px">Dual Subtitles & EPUB Languages</div>
 
     <label>
       <span>Main language</span>
-      <input type="text" id="opt-epub-main" placeholder="e.g. ja, ko, en">
+      <select id="opt-epub-main" class="lang-select">
+        <option value="en">Loading tracks...</option>
+      </select>
     </label>
 
     <label>
       <span>Second language</span>
-      <input type="text" id="opt-epub-sub" placeholder="e.g. en (optional)">
+      <select id="opt-epub-sub" class="lang-select">
+        <option value="de">Loading tracks...</option>
+      </select>
     </label>
   </div>
 

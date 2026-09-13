@@ -2,6 +2,10 @@
 // Runs in an isolated world but can communicate with the page via CustomEvents
 // and with the popup via chrome.runtime messages.
 
+(() => {
+if (window.__NSD_CONTENT_SCRIPT_LOADED__) return;
+window.__NSD_CONTENT_SCRIPT_LOADED__ = true;
+
 const WEBVTT = 'webvtt-lssdh-ios8';
 const DFXP = 'dfxp-ls-sdh';
 const SIMPLE = 'simplesdh';
@@ -31,6 +35,7 @@ let batchAll = null;
 let batchSeason = null;
 let batchToEnd = null;
 let batch = null;
+let currentVideoType = 'unknown';
 
 // --- Settings (loaded from chrome.storage) ---
 let settings = {
@@ -46,25 +51,40 @@ let settings = {
 
 chrome.storage.local.get(settings, stored => {
   Object.assign(settings, stored);
+  try {
+    localStorage.setItem('NSD_force-all-lang', settings.forceSubs);
+    localStorage.setItem('NSD_pref-locale', settings.prefLocale || '');
+  } catch (_) {}
 });
 
 chrome.storage.onChanged.addListener((changes) => {
   for (const [key, { newValue }] of Object.entries(changes)) {
     if (key in settings) settings[key] = newValue;
+    if (key === 'forceSubs') {
+      try { localStorage.setItem('NSD_force-all-lang', newValue); } catch (_) {}
+    }
+    if (key === 'prefLocale') {
+      try { localStorage.setItem('NSD_pref-locale', newValue || ''); } catch (_) {}
+    }
   }
 });
 
-// --- Inject page-level script ---
-const sc = document.createElement('script');
-sc.src = chrome.runtime.getURL('inject.js');
-sc.onload = () => sc.remove();
-(document.head || document.documentElement).appendChild(sc);
+// --- Inject page-level script (fallback if not injected by manifest) ---
+try {
+  if (!window.__NSD_INJECTED__) {
+    const sc = document.createElement('script');
+    sc.src = chrome.runtime.getURL('inject.js');
+    sc.onload = () => sc.remove();
+    (document.head || document.documentElement).appendChild(sc);
+  }
+} catch (_) {}
 
 // --- UI: download menu ---
 const MENU_HTML = `
 <ol>
   <li class="nsd-header">Netflix Subtitle Downloader</li>
   <li class="nsd-action nsd-download">Download subs for this <span class="nsd-series">episode</span><span class="nsd-not-series">movie</span></li>
+  <li class="nsd-action nsd-download-dual">Download Dual Subs (.srt)</li>
   <li class="nsd-action nsd-download-to-end nsd-series-only">Download subs from this ep to end</li>
   <li class="nsd-action nsd-download-season nsd-series-only">Download subs for this season</li>
   <li class="nsd-action nsd-download-all nsd-series-only">Download subs for all seasons</li>
@@ -98,10 +118,12 @@ body:hover #nsd-menu { display: block; }
 #nsd-menu .nsd-action { cursor: pointer; display: none; }
 #nsd-menu .nsd-action:hover { background: #444; }
 #nsd-menu:hover .nsd-action { display: block; }
+#nsd-menu:not(.nsd-is-series) .nsd-series { display: none !important; }
+#nsd-menu.nsd-is-series .nsd-series { display: inline !important; }
+#nsd-menu.nsd-is-series .nsd-not-series { display: none !important; }
+#nsd-menu:not(.nsd-is-series) .nsd-not-series { display: inline !important; }
 #nsd-menu:not(.nsd-is-series) .nsd-series-only { display: none !important; }
-#nsd-menu.nsd-is-series .nsd-not-series { display: none; }
 #nsd-menu.nsd-is-series .nsd-movie-only { display: none !important; }
-#nsd-menu:not(.nsd-is-series) .nsd-movie-only { }
 
 #nsd-progress-bars {
   position: fixed;
@@ -244,6 +266,12 @@ function ensureMenu() {
     document.body.appendChild(menu);
 
     menu.querySelector('.nsd-download').addEventListener('click', downloadThis);
+    const dualLi = menu.querySelector('.nsd-download-dual');
+    if (dualLi) {
+      dualLi.addEventListener('click', () => {
+        downloadDualThis(settings.epubMainLang || 'de', settings.epubSubLang || 'en');
+      });
+    }
     menu.querySelector('.nsd-download-to-end').addEventListener('click', () => downloadBatchFrom(batchToEnd));
     menu.querySelector('.nsd-download-season').addEventListener('click', () => downloadBatchFrom(batchSeason));
     menu.querySelector('.nsd-download-all').addEventListener('click', () => downloadBatchFrom(batchAll));
@@ -289,7 +317,8 @@ class ProgressBar {
 
 // --- Process intercepted data ---
 function processSubInfo(result) {
-  const tracks = result.timedtexttracks;
+  const tracks = result.timedtexttracks || result.textTracks || result.timedTextTracks;
+  if (!tracks) return;
   const subs = {};
   for (const track of tracks) {
     if (track.isNoneTrack) continue;
@@ -297,15 +326,16 @@ function processSubInfo(result) {
     let type = SUB_TYPES[track.rawTrackType];
     if (typeof type === 'undefined') type = `[${track.rawTrackType}]`;
     const variant = track.trackVariant ? `-${track.trackVariant}` : '';
-    const lang = track.language + type + variant + (track.isForcedNarrative ? '-forced' : '');
+    const langCode = track.language || track.bcp47 || 'und';
+    const lang = langCode + type + variant + (track.isForcedNarrative ? '-forced' : '');
 
     const formats = {};
     for (const format of ALL_FORMATS) {
-      const downloadables = track.ttDownloadables[format];
+      const downloadables = (track.ttDownloadables || track.downloadables || {})[format];
       if (!downloadables) continue;
       let urls;
       if (downloadables.downloadUrls) urls = Object.values(downloadables.downloadUrls);
-      else if (downloadables.urls) urls = downloadables.urls.map(u => u.url);
+      else if (downloadables.urls) urls = downloadables.urls.map(u => (typeof u === 'string' ? u : u.url));
       else continue;
       formats[format] = [urls, EXTENSIONS[format]];
     }
@@ -317,18 +347,34 @@ function processSubInfo(result) {
       }
     }
   }
-  subCache[result.movieId] = subs;
+
+  const validCount = Object.keys(subs).length;
+  if (validCount === 0) {
+    console.debug('[NSD] Candidate had no downloadable URLs, skipping.');
+    return;
+  }
+
+    if (result.movieId) {
+      subCache[result.movieId] = subs;
+    }
+    const currentId = getVideoId();
+    if (currentId) {
+      subCache[currentId] = subs;
+    }
+    subCache['latest'] = subs;
+    console.log('[NSD] Subtitles processed successfully. Available tracks:', validCount);
 }
 
 function processMetadata(data) {
   const menu = ensureMenu();
-  menu.style.display = 'none';
+  menu.style.display = document.location.pathname.startsWith('/watch') ? '' : 'none';
   menu.classList.remove('nsd-is-series');
 
   const result = data.video;
   const { type, title } = result;
 
   if (type === 'show') {
+    currentVideoType = 'show';
     batchAll = [];
     batchSeason = [];
     batchToEnd = [];
@@ -359,7 +405,15 @@ function processMetadata(data) {
       if (toEnd) batchToEnd.push(id);
     }
   } else if (type === 'movie' || type === 'supplemental') {
-    titleCache[result.id] = { type, title };
+    currentVideoType = 'movie';
+    batchAll = null;
+    batchSeason = null;
+    batchToEnd = null;
+    menu.classList.remove('nsd-is-series');
+    if (result.id) titleCache[result.id] = { type, title };
+    const curVid = getVideoId();
+    if (curVid) titleCache[curVid] = { type, title };
+    titleCache['latest'] = { type, title };
   } else {
     return;
   }
@@ -392,12 +446,14 @@ function processMetadata(data) {
 
   // Wait for sub cache to populate, then show menu
   const waitForSubs = async () => {
-    while (getSubsFromCache(true) === null) await sleep(0.1);
+    while (getSubsFromCache(true) === null) await sleep(0.2);
     if (document.location.pathname.startsWith('/watch'))
       menu.style.display = '';
 
-    // Resume ZIP batch if active
-    if (batch && batch.length > 0) downloadBatch(true);
+    // Only resume ZIP batch if explicitly active
+    if (sessionStorage.getItem('NSD_batch_active') === 'true' && batch && batch.length > 0) {
+      downloadBatch(true);
+    }
 
     // Resume EPUB batch if active
     if (sessionStorage.getItem('NSD_epub_batch')) {
@@ -410,7 +466,11 @@ function processMetadata(data) {
 // --- Helpers ---
 const sleep = (sec, val) => new Promise(r => setTimeout(r, sec * 1000, val));
 
-const getVideoId = () => window.location.pathname.split('/').pop();
+const getVideoId = () => {
+  const m = window.location.pathname.match(/\/watch\/(\d+)/);
+  if (m) return m[1];
+  return window.location.pathname.split('/').filter(Boolean).pop() || '';
+};
 
 const addCoverCandidate = url => {
   if (url && !coverCandidates.includes(url)) coverCandidates.push(url);
@@ -418,45 +478,257 @@ const addCoverCandidate = url => {
 
 function getFromCache(cache, name, silent) {
   const id = getVideoId();
-  if (cache[id]) return cache[id];
+  if (id && cache[id] && Object.keys(cache[id]).length > 0) return cache[id];
 
   const overrideId = idOverrides[id];
-  if (overrideId && cache[overrideId]) return cache[overrideId];
+  if (overrideId && cache[overrideId] && Object.keys(cache[overrideId]).length > 0) return cache[overrideId];
+
+  if (name === 'subtitles') {
+    if (cache['latest'] && Object.keys(cache['latest']).length > 0) return cache['latest'];
+    for (const k of Object.keys(cache)) {
+      if (cache[k] && Object.keys(cache[k]).length > 0) return cache[k];
+    }
+  }
 
   if (silent) return null;
-  alert("Couldn't find " + name + ". Wait for the player to load, then try again.");
-  throw new Error('Cache miss: ' + name);
+  if (name === 'title') {
+    return { title: getCleanDocumentTitle(), type: currentVideoType === 'show' ? 'show' : 'movie' };
+  }
+  return null;
 }
 
 const getSubsFromCache = silent => getFromCache(subCache, 'subtitles', silent);
 
 const pad = (n, l) => `${l}${n.toString().padStart(2, '0')}`;
-const safeTitle = t => t.trim().replace(/[:*?"<>|\\\/]+/g, '_').replace(/ /g, '.');
+const safeTitle = t => (t || 'Netflix').trim().replace(/[:*?"<>|\\\/]+/g, '_').replace(/ /g, '.');
+
+function getCleanDocumentTitle() {
+  let raw = document.title || '';
+  raw = raw.replace(/\s*[-|]\s*Netflix\s*$/i, '')
+           .replace(/^Watch\s+/i, '')
+           .trim();
+  return raw || 'Netflix_Video';
+}
 
 function getTitleFromCache() {
-  const t = getFromCache(titleCache, 'title');
+  const t = getFromCache(titleCache, 'title', true) || {
+    title: getCleanDocumentTitle(),
+    type: currentVideoType === 'show' ? 'show' : 'movie'
+  };
   const parts = [t.title];
   if (t.type === 'show') {
-    const s = pad(t.season, 'S');
+    const s = pad(t.season || 1, 'S');
     if (t.hiddenNumber) {
-      parts.push(s, t.subtitle);
+      if (t.subtitle) parts.push(s, t.subtitle);
     } else {
-      parts.push(s + pad(t.episode, 'E'));
-      if (settings.epTitleInFilename) parts.push(t.subtitle);
+      parts.push(s + pad(t.episode || 1, 'E'));
+      if (settings.epTitleInFilename && t.subtitle) parts.push(t.subtitle);
     }
   }
-  return [safeTitle(parts.join('.')), safeTitle(t.title)];
+  return [safeTitle(parts.join('.')), safeTitle(t.title), t.title];
 }
 
 function pickFormat(formats) {
+  if (!formats || typeof formats !== 'object') return null;
   const order = settings.subFormat === DFXP ? ALL_FORMATS : ALL_FORMATS_PREFER_VTT;
   for (const f of order) {
-    if (formats[f]) return formats[f];
+    if (formats[f] && formats[f][0] && formats[f][0].length > 0) return formats[f];
   }
+  for (const f of Object.keys(formats)) {
+    if (formats[f] && formats[f][0] && formats[f][0].length > 0) return formats[f];
+  }
+  return null;
 }
 
 function popRandom(arr) {
   return arr.splice(Math.random() * arr.length | 0, 1)[0];
+}
+
+// --- Language aliases & matching ---
+const RAW_ALIASES = [
+  ['de', 'ger', 'german', 'deutsch'],
+  ['en', 'eng', 'english'],
+  ['es', 'spa', 'spanish', 'español', 'espanol'],
+  ['fr', 'fre', 'fra', 'french', 'français', 'francais'],
+  ['it', 'ita', 'italian', 'italiano'],
+  ['ja', 'jpn', 'japanese', 'nihongo'],
+  ['ko', 'kor', 'korean'],
+  ['hi', 'hin', 'hindi'],
+  ['pt', 'por', 'portuguese'],
+  ['ru', 'rus', 'russian'],
+  ['zh', 'chi', 'zho', 'chinese'],
+  ['nl', 'dut', 'nla', 'dutch'],
+  ['pl', 'pol', 'polish'],
+  ['tr', 'tur', 'turkish'],
+  ['ar', 'ara', 'arabic'],
+  ['sv', 'swe', 'swedish'],
+  ['da', 'dan', 'danish'],
+  ['fi', 'fin', 'finnish'],
+  ['nb', 'nor', 'norwegian'],
+  ['no', 'nor', 'norwegian']
+];
+
+const ALIAS_LOOKUP = {};
+for (const group of RAW_ALIASES) {
+  for (const name of group) {
+    ALIAS_LOOKUP[name.toLowerCase()] = group;
+  }
+}
+
+function findTrackKey(subs, query) {
+  if (!subs || !query) return null;
+  const q = query.trim().toLowerCase();
+  const keys = Object.keys(subs);
+  if (keys.length === 0) return null;
+
+  if (subs[query]) return query;
+
+  const aliases = ALIAS_LOOKUP[q] || [q];
+
+  // 1. Check non-forced tracks with prefix/exact match
+  const nonForced = keys.filter(k => !k.endsWith('-forced'));
+  for (const alias of aliases) {
+    const match = nonForced.find(k => {
+      const lower = k.toLowerCase();
+      return lower === alias || lower.startsWith(alias + '[') || lower.startsWith(alias + '-') || lower.startsWith(alias);
+    });
+    if (match) return match;
+  }
+
+  // 2. Substring in non-forced
+  for (const alias of aliases) {
+    const match = nonForced.find(k => k.toLowerCase().includes(alias));
+    if (match) return match;
+  }
+
+  // 3. Check all tracks including forced
+  for (const alias of aliases) {
+    const match = keys.find(k => {
+      const lower = k.toLowerCase();
+      return lower === alias || lower.startsWith(alias + '[') || lower.startsWith(alias + '-') || lower.startsWith(alias);
+    });
+    if (match) return match;
+  }
+
+  return null;
+}
+
+// --- Dual Subtitle Generator (.srt) ---
+function formatSRTTimestamp(ms) {
+  if (ms < 0) ms = 0;
+  const totalSeconds = Math.floor(ms / 1000);
+  const millis = ms % 1000;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
+}
+
+function captionsToSRT(captions) {
+  let srt = '';
+  let index = 1;
+  for (const c of captions) {
+    if (!c.text) continue;
+    srt += `${index}\n`;
+    srt += `${formatSRTTimestamp(c.start)} --> ${formatSRTTimestamp(c.end)}\n`;
+    srt += `${c.text}\n\n`;
+    index++;
+  }
+  return srt;
+}
+
+function clearActiveBatch(clearEpub = false) {
+  batch = null;
+  try {
+    sessionStorage.removeItem('NSD_batch');
+    sessionStorage.removeItem('NSD_batch_active');
+    sessionStorage.removeItem('NSD_zip');
+    if (clearEpub) sessionStorage.removeItem('NSD_epub_batch');
+  } catch (_) {}
+}
+
+function generateDualSRT(mainVttText, subVttText, color = '#ffff55') {
+  const mainCaps = typeof parseVTT === 'function' ? parseVTT(mainVttText) : [];
+  const subCaps = typeof parseVTT === 'function' ? parseVTT(subVttText) : [];
+
+  if (!mainCaps.length && !subCaps.length) return '';
+  if (!mainCaps.length) return captionsToSRT(subCaps);
+  if (!subCaps.length) return captionsToSRT(mainCaps);
+
+  const items = typeof alignCaptions === 'function' ? alignCaptions(mainCaps, subCaps) : [];
+
+  let srt = '';
+  let index = 1;
+  for (const item of items) {
+    const lines = [];
+    if (item.mainText) lines.push(item.mainText);
+    if (item.subTexts && item.subTexts.length > 0) {
+      lines.push(`<font color="${color}">${item.subTexts.join('\n')}</font>`);
+    }
+    if (lines.length === 0) continue;
+
+    srt += `${index}\n`;
+    srt += `${formatSRTTimestamp(item.start)} --> ${formatSRTTimestamp(item.end)}\n`;
+    srt += `${lines.join('\n')}\n\n`;
+    index++;
+  }
+  return srt;
+}
+
+async function downloadDualThis(mainLangReq, subLangReq) {
+  clearActiveBatch();
+
+  const subs = getSubsFromCache(true);
+  if (!subs || typeof subs !== 'object' || Object.keys(subs).length === 0) {
+    alert('Subtitles are not yet ready. Please make sure the video is playing in Netflix, then try again.');
+    return;
+  }
+  const [title] = getTitleFromCache();
+  const availableLangs = Object.keys(subs);
+
+  const mainTrackKey = findTrackKey(subs, mainLangReq);
+  const subTrackKey = findTrackKey(subs, subLangReq);
+
+  if (!mainTrackKey && !subTrackKey) {
+    alert(`Neither "${mainLangReq}" nor "${subLangReq}" found in available subtitle tracks.\n\nAvailable tracks:\n${availableLangs.join(', ')}`);
+    return;
+  }
+  if (!mainTrackKey) {
+    alert(`Main language "${mainLangReq}" not found in available subtitle tracks.\n\nAvailable tracks:\n${availableLangs.join(', ')}`);
+    return;
+  }
+  if (!subTrackKey) {
+    alert(`Second language "${subLangReq}" not found in available subtitle tracks.\n\nAvailable tracks:\n${availableLangs.join(', ')}`);
+    return;
+  }
+
+  const progress = new ProgressBar(2);
+  try {
+    const mainVtt = await fetchVttForLang(subs, mainTrackKey);
+    progress.increment();
+    const subVtt = await fetchVttForLang(subs, subTrackKey);
+    progress.increment();
+
+    if (!mainVtt || !subVtt) {
+      alert('Failed to download subtitle content for one or both languages.');
+      return;
+    }
+
+    const dualSrt = generateDualSRT(mainVtt, subVtt, '#ffff55');
+    if (!dualSrt || !dualSrt.trim()) {
+      alert('Could not parse subtitles to generate dual SRT.');
+      return;
+    }
+
+    const blob = new Blob([dualSrt], { type: 'text/plain;charset=utf-8' });
+    const filename = `${title}.WEBRip.Netflix.Dual.${mainTrackKey}+${subTrackKey}.srt`;
+    saveAs(blob, filename);
+  } catch (err) {
+    console.error('[NSD] Dual subtitle download failed:', err);
+    alert('Dual subtitle download failed: ' + err.message);
+  } finally {
+    progress.destroy();
+  }
 }
 
 // --- Download logic ---
@@ -465,64 +737,179 @@ async function downloadSubs(zip) {
   const [title, seriesTitle] = getTitleFromCache();
 
   let filteredLangs;
-  if (!settings.langs) {
+  if (!settings.langs || !settings.langs.trim()) {
     filteredLangs = Object.keys(subs);
   } else {
-    const re = new RegExp(
-      '^(' + settings.langs
-        .replace(/\[/g, '\\[').replace(/\]/g, '\\]')
-        .replace(/-/g, '\\-').replace(/\s/g, '')
-        .replace(/,/g, '|') + ')'
-    );
-    filteredLangs = Object.keys(subs).filter(l => l.match(re));
+    const tokens = settings.langs.split(/[\s,;]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+    if (tokens.length === 0) {
+      filteredLangs = Object.keys(subs);
+    } else {
+      const matched = new Set();
+      for (const token of tokens) {
+        const track = findTrackKey(subs, token);
+        if (track) matched.add(track);
+        const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp('^' + escaped, 'i');
+        for (const k of Object.keys(subs)) {
+          if (re.test(k)) matched.add(k);
+        }
+      }
+      filteredLangs = Array.from(matched);
+      if (filteredLangs.length === 0) {
+        console.info('[NSD] Filter "' + settings.langs + '" had no direct match. Using all available tracks:', Object.keys(subs));
+        filteredLangs = Object.keys(subs);
+      }
+    }
   }
 
   const progress = new ProgressBar(filteredLangs.length);
   let stop = false;
 
   for (const lang of filteredLangs) {
-    const [urls, ext] = pickFormat(subs[lang]);
+    const formatInfo = pickFormat(subs[lang]);
+    if (!formatInfo) continue;
+    const [rawUrls, ext] = formatInfo;
+    const urls = Array.isArray(rawUrls) ? [...rawUrls] : [];
+
     while (urls.length > 0) {
       const url = popRandom(urls);
-      let result;
+      let resp = null;
       try {
-        result = await Promise.race([
+        const raceRes = await Promise.race([
           fetch(url, { mode: 'cors' }),
           progress.stop,
-          sleep(30, STOP)
+          sleep(20, 'TIMEOUT')
         ]);
-      } catch (_) {
-        result = STOP;
+        if (raceRes === STOP) {
+          stop = true;
+          break;
+        }
+        if (raceRes instanceof Response && raceRes.ok) {
+          resp = raceRes;
+        }
+      } catch (err) {
+        console.debug('[NSD] Mirror fetch failed, trying next mirror:', err);
       }
-      if (result === STOP) { stop = true; break; }
-      progress.increment();
-      const data = await result.text();
-      if (data.length > 0) {
-        zip.file(`${title}.WEBRip.Netflix.${lang}.${ext}`, data);
-        break;
+
+      if (resp) {
+        try {
+          const data = await resp.text();
+          if (data && data.length > 10) {
+            zip.file(`${title}.WEBRip.Netflix.${lang}.${ext}`, data);
+            progress.increment();
+            break;
+          }
+        } catch (_) {}
       }
     }
     if (stop) break;
   }
 
-  if (await Promise.race([progress.stop, {}]) === STOP) stop = true;
   progress.destroy();
   return [seriesTitle, stop];
 }
 
+function sanitizeFilename(name) {
+  if (!name) return 'Netflix_Video';
+  return name
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+|\.+$/g, '') || 'Netflix_Video';
+}
+
+function fallbackDomDownload(blob, filename) {
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.style.display = 'none';
+    a.href = url;
+    a.download = filename;
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { a.remove(); } catch (_) {}
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    }, 2000);
+  } catch (err) {
+    console.error('[NSD] DOM download fallback failed:', err);
+    if (typeof window.saveAs === 'function' && window.saveAs !== saveAs) {
+      window.saveAs(blob, filename);
+    }
+  }
+}
+
+function saveAs(blob, rawFilename) {
+  let filename = rawFilename || 'download';
+  const isEpub = (blob && blob.type === 'application/epub+zip') || filename.toLowerCase().endsWith('.epub');
+  const isZip = (blob && blob.type === 'application/zip') || filename.toLowerCase().endsWith('.zip');
+  const isSrt = filename.toLowerCase().endsWith('.srt');
+
+  if (isEpub) {
+    const base = filename.replace(/\.epub$/i, '');
+    filename = sanitizeFilename(base) + '.epub';
+  } else if (isZip) {
+    const base = filename.replace(/\.zip$/i, '');
+    filename = sanitizeFilename(base) + '.zip';
+  } else if (isSrt) {
+    const base = filename.replace(/\.srt$/i, '');
+    filename = sanitizeFilename(base) + '.srt';
+  } else {
+    filename = sanitizeFilename(filename);
+  }
+
+  // 1. Primary: Use background service worker via chrome.downloads API.
+  // This bypasses all page CSP / synthetic click limitations and guarantees
+  // Chrome saves the file with its exact filename and extension.
+  try {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const dataUrl = reader.result;
+      chrome.runtime.sendMessage({
+        action: 'downloadFile',
+        url: dataUrl,
+        filename: filename
+      }, resp => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) {
+          fallbackDomDownload(blob, filename);
+        }
+      });
+    };
+    reader.onerror = () => {
+      fallbackDomDownload(blob, filename);
+    };
+    reader.readAsDataURL(blob);
+  } catch (_) {
+    fallbackDomDownload(blob, filename);
+  }
+}
+
 async function saveZip(zip, title) {
-  const blob = await zip.generateAsync({ type: 'blob' });
+  const fileCount = Object.keys(zip.files).length;
+  if (fileCount === 0) {
+    alert('No subtitle tracks could be downloaded. The Netflix session or subtitle URLs may have expired. Please refresh the Netflix tab (F5) and play the video, then try downloading again.');
+    return;
+  }
+  const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/zip' });
   saveAs(blob, title + '.zip');
 }
 
 async function downloadThis() {
-  const zip = new JSZip();
-  const [title] = await downloadSubs(zip);
-  saveZip(zip, title);
+  try {
+    clearActiveBatch();
+    const zip = new JSZip();
+    const [title] = await downloadSubs(zip);
+    saveZip(zip, title);
+  } catch (err) {
+    console.error('NSD download failed:', err);
+  }
 }
 
 async function downloadBatchFrom(ids) {
+  if (!ids || ids.length === 0) return;
+  sessionStorage.setItem('NSD_batch_active', 'true');
   batch = [...ids];
+  sessionStorage.setItem('NSD_batch', JSON.stringify(batch));
   downloadBatch(false);
 }
 
@@ -557,18 +944,18 @@ async function downloadBatch(isResume) {
 
   if (stop || batch.length === 0) {
     saveZip(zip, title);
-    batch = null;
-    sessionStorage.removeItem('NSD_zip');
+    clearActiveBatch();
   } else {
     // Save zip to sessionStorage and navigate to next episode
     const b64 = await zip.generateAsync({ type: 'base64' });
     try {
       sessionStorage.setItem('NSD_zip', b64);
       sessionStorage.setItem('NSD_batch', JSON.stringify(batch));
+      sessionStorage.setItem('NSD_batch_active', 'true');
     } catch (_) {
       // sessionStorage full — just save what we have
       saveZip(zip, title);
-      batch = null;
+      clearActiveBatch();
       return;
     }
     await sleep(settings.batchDelay);
@@ -596,7 +983,7 @@ function showEpubModal(scope) {
     return;
   }
 
-  const scopeLabel = scope === 'all' ? 'all seasons' : scope === 'season' ? 'this season' : 'this movie';
+  const scopeLabel = scope === 'all' ? 'all seasons' : scope === 'season' ? 'this season' : scope === 'episode' ? 'this episode' : 'this movie';
   const langOptions = langs.map(l => `<option value="${l}">${l}</option>`).join('');
 
   const overlay = document.createElement('div');
@@ -753,7 +1140,8 @@ async function downloadAsEpub(mainLang, subLang, scope, overlay, coverUrl) {
   goBtn.textContent = 'Starting...';
 
   try {
-    const [titleWithEp, seriesTitle] = getTitleFromCache();
+    const [titleWithEp, seriesTitle, rawDisplayTitle] = getTitleFromCache();
+    const displayTitle = rawDisplayTitle || seriesTitle || titleWithEp;
 
     // Determine which episodes to include
     let episodeIds;
@@ -771,7 +1159,9 @@ async function downloadAsEpub(mainLang, subLang, scope, overlay, coverUrl) {
       chapters: [],
       mainLang,
       subLang: subLang || null,
-      seriesTitle: seriesTitle || titleWithEp,
+      seriesTitle: displayTitle,
+      fileBaseTitle: safeTitle(seriesTitle || titleWithEp),
+      scope,
       coverUrl: coverUrl || null
     };
     sessionStorage.setItem('NSD_epub_batch', JSON.stringify(epubBatch));
@@ -800,25 +1190,30 @@ async function processEpubBatchStep() {
 
   const currentId = parseInt(getVideoId());
   const epSubs = getSubsFromCache(true);
-  const epTitle = titleCache[currentId];
+  const epTitle = titleCache[currentId] || titleCache[getVideoId()] || getFromCache(titleCache, 'title', true);
 
   // Build chapter title
   let chapterTitle;
   if (epTitle && epTitle.type === 'show') {
     chapterTitle = `Season ${epTitle.season} Episode ${epTitle.episode}`;
+    if (epTitle.subtitle) chapterTitle += ` - ${epTitle.subtitle}`;
+  } else if (epTitle && epTitle.type === 'movie') {
+    chapterTitle = epTitle.title || epubBatch.seriesTitle || 'Movie';
   } else {
-    chapterTitle = `Episode ${epubBatch.chapters.length + 1}`;
+    chapterTitle = epubBatch.seriesTitle || (epubBatch.remaining && epubBatch.remaining.length > 1 ? `Chapter ${epubBatch.chapters.length + 1}` : 'Movie');
   }
 
-  // Fetch and parse main language
-  if (epSubs && epSubs[epubBatch.mainLang]) {
-    const mainVtt = await fetchVttForLang(epSubs, epubBatch.mainLang);
+  // Fetch and parse main language using track key resolution
+  const mainTrackKey = epSubs ? findTrackKey(epSubs, epubBatch.mainLang) : null;
+  if (epSubs && mainTrackKey) {
+    const mainVtt = await fetchVttForLang(epSubs, mainTrackKey);
     if (mainVtt) {
       const mainCaptions = parseVTT(mainVtt);
 
       let subCaptions = null;
-      if (epubBatch.subLang && epubBatch.subLang !== epubBatch.mainLang && epSubs[epubBatch.subLang]) {
-        const subVtt = await fetchVttForLang(epSubs, epubBatch.subLang);
+      const subTrackKey = epubBatch.subLang && epubBatch.subLang !== epubBatch.mainLang ? findTrackKey(epSubs, epubBatch.subLang) : null;
+      if (subTrackKey) {
+        const subVtt = await fetchVttForLang(epSubs, subTrackKey);
         if (subVtt) subCaptions = parseVTT(subVtt);
       }
 
@@ -872,8 +1267,10 @@ async function processEpubBatchStep() {
     }
 
     const zip = generateEPUB(epubBatch.seriesTitle, epubBatch.chapters, coverData);
-    const blob = await zip.generateAsync({ type: 'blob' });
-    saveAs(blob, epubBatch.seriesTitle + '.epub');
+    const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
+    const cleanBase = sanitizeFilename(epubBatch.fileBaseTitle || epubBatch.seriesTitle || 'Movie');
+    const filename = cleanBase.endsWith('.epub') ? cleanBase : (cleanBase + '.epub');
+    saveAs(blob, filename);
   } else {
     // Save state and navigate to next episode
     sessionStorage.setItem('NSD_epub_batch', JSON.stringify(epubBatch));
@@ -908,10 +1305,14 @@ async function fetchVttForLang(epSubs, lang) {
   return null;
 }
 
-// Resume batch from sessionStorage on page load
+// Resume batch from sessionStorage on page load only if active
 try {
-  const saved = sessionStorage.getItem('NSD_batch');
-  if (saved) batch = JSON.parse(saved);
+  if (sessionStorage.getItem('NSD_batch_active') === 'true') {
+    const saved = sessionStorage.getItem('NSD_batch');
+    if (saved) batch = JSON.parse(saved);
+  } else {
+    clearActiveBatch();
+  }
 } catch (_) {}
 
 // --- Listen for data from injected page script ---
@@ -929,12 +1330,34 @@ window.addEventListener('netflix_sub_downloader_data', e => {
 
 // --- Listen for messages from popup ---
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  const isSeries = currentVideoType === 'show' ||
+    (currentVideoType !== 'movie' && (
+      (batchSeason !== null && batchSeason.length > 0) ||
+      (batchAll !== null && batchAll.length > 0) ||
+      !!document.getElementById('nsd-menu')?.classList.contains('nsd-is-series')
+    ));
+
   if (msg.action === 'getStatus') {
     const subs = getSubsFromCache(true);
-    const langList = subs ? Object.keys(subs) : [];
-    sendResponse({ onWatchPage: document.location.pathname.startsWith('/watch'), langList });
+    const langList = (subs && typeof subs === 'object') ? Object.keys(subs) : [];
+    const isBatchActive = sessionStorage.getItem('NSD_batch_active') === 'true' && batch && batch.length > 0;
+    sendResponse({
+      onWatchPage: document.location.pathname.includes('/watch'),
+      langList,
+      isSeries: !!isSeries,
+      isBatchActive
+    });
   } else if (msg.action === 'download') {
     downloadThis();
+    sendResponse({ ok: true });
+  } else if (msg.action === 'downloadDual') {
+    downloadDualThis(msg.mainLang || settings.epubMainLang || 'de', msg.subLang || settings.epubSubLang || 'en');
+    sendResponse({ ok: true });
+  } else if (msg.action === 'downloadEpubSingle' || msg.action === 'downloadEpubMovie') {
+    showEpubModal(isSeries ? 'episode' : 'movie');
+    sendResponse({ ok: true });
+  } else if (msg.action === 'clearBatch') {
+    clearActiveBatch(true);
     sendResponse({ ok: true });
   } else if (msg.action === 'downloadSeason') {
     if (batchSeason) downloadBatchFrom(batchSeason);
@@ -952,3 +1375,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ langs: getAvailableLangs() });
   }
 });
+})();

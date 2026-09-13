@@ -81,65 +81,157 @@ function parseTimestamp(str) {
   }
 }
 
-// ========== Dual-language merger ==========
+// ========== Shared Caption Alignment (Maximum Temporal Overlap) ==========
+
+function calcOverlap(startA, endA, startB, endB) {
+  const s = Math.max(startA, startB);
+  const e = Math.min(endA, endB);
+  return Math.max(0, e - s);
+}
+
+// Aligns secondary captions against primary captions based on maximum temporal overlap.
+// Returns an array of items: [{ start, end, mainText, subTexts: string[] }]
+function alignCaptions(mainCaptions, subCaptions) {
+  if (!subCaptions || subCaptions.length === 0) {
+    return mainCaptions.map(m => ({
+      start: m.start,
+      end: m.end,
+      mainText: m.text,
+      subTexts: []
+    }));
+  }
+
+  const assigned = new Map();
+  const standaloneSubs = [];
+
+  for (const s of subCaptions) {
+    let bestMainIdx = -1;
+    let maxOverlap = 0;
+
+    for (let i = 0; i < mainCaptions.length; i++) {
+      const m = mainCaptions[i];
+      const ov = calcOverlap(s.start, s.end, m.start, m.end);
+      if (ov > maxOverlap) {
+        maxOverlap = ov;
+        bestMainIdx = i;
+      }
+    }
+
+    const sDuration = Math.max(1, s.end - s.start);
+    if (bestMainIdx !== -1 && (maxOverlap >= 150 || (maxOverlap / sDuration) >= 0.15)) {
+      if (!assigned.has(bestMainIdx)) assigned.set(bestMainIdx, []);
+      assigned.get(bestMainIdx).push(s);
+    } else {
+      standaloneSubs.push(s);
+    }
+  }
+
+  const allItems = [];
+
+  for (let i = 0; i < mainCaptions.length; i++) {
+    const m = mainCaptions[i];
+    const matching = assigned.get(i) || [];
+    allItems.push({
+      start: m.start,
+      end: m.end,
+      mainText: m.text,
+      subTexts: matching.map(s => s.text)
+    });
+  }
+
+  for (const s of standaloneSubs) {
+    allItems.push({
+      start: s.start,
+      end: s.end,
+      mainText: '',
+      subTexts: [s.text]
+    });
+  }
+
+  allItems.sort((a, b) => a.start - b.start || a.end - b.end);
+  return allItems;
+}
+
+// ========== Dual-language EPUB HTML generator ==========
+
+function cleanSubtitleText(str) {
+  if (!str) return '';
+  return str
+    .replace(/&lrm;|&rlm;/gi, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isSoundDescription(text) {
+  if (!text) return false;
+  const t = text.trim();
+  return (t.startsWith('[') && t.endsWith(']')) ||
+         (t.startsWith('(') && t.endsWith(')')) ||
+         (t.startsWith('♪') && t.endsWith('♪')) ||
+         (t.startsWith('#') && t.endsWith('#'));
+}
 
 function mergeSubtitles(mainCaptions, subCaptions) {
   if (!subCaptions || subCaptions.length === 0) {
     // Single language
-    return mainCaptions.map(c => {
-      const text = c.text.replace(/&lrm;/g, '');
-      return `<h3>${escapeHTML(text)}</h3>\n`;
-    }).join('');
-  }
-
-  // Dual language with 400ms sync threshold
-  let html = '';
-  let iMain = 0;
-  let iSub = 0;
-  const threshold = 400;
-  let lastMainStart = 0;
-
-  while (iMain < mainCaptions.length) {
-    while (iSub < subCaptions.length) {
-      const cm = mainCaptions[iMain];
-      const cs = subCaptions[iSub];
-
-      if (cm.start - threshold <= cs.start) {
-        // Paragraph break for gaps > 5 seconds
-        if (cm.start > lastMainStart + 5000) {
-          html += '<p/>\n';
-        }
-        const text = cm.text.replace(/&lrm;/g, '').replace(/\n/g, ' ');
-        if (text.startsWith('[') && text.endsWith(']')) {
-          html += `<div class="cc">${escapeHTML(text)}</div>\n`;
-        } else {
-          html += `${escapeHTML(text)}\n`;
-        }
-        lastMainStart = cm.start;
-        break;
-      } else {
-        const subText = cs.text.replace(/&lrm;/g, '').replace(/\n/g, ' ');
-        html += `<div class="sub">${escapeHTML(subText)}</div>\n`;
-        iSub++;
+    let html = '<div class="dialogue-container single">\n';
+    let lastStart = 0;
+    for (const c of mainCaptions) {
+      if (c.start > lastStart + 5000 && lastStart > 0) {
+        html += '<hr class="break" />\n';
       }
+      lastStart = c.start;
+
+      const clean = cleanSubtitleText(c.text);
+      if (!clean) continue;
+      const ccClass = isSoundDescription(clean) ? ' cc' : '';
+      html += `<p class="main${ccClass}">${escapeHTML(clean)}</p>\n`;
     }
-    iMain++;
+    html += '</div>\n';
+    return html;
   }
 
-  while (iSub < subCaptions.length) {
-    html += `${escapeHTML(subCaptions[iSub].text)}\n`;
-    iSub++;
+  const allItems = alignCaptions(mainCaptions, subCaptions);
+
+  let html = '<div class="dialogue-container dual">\n';
+  let lastStart = 0;
+  for (const item of allItems) {
+    // Paragraph break for gaps > 5 seconds
+    if (item.start > lastStart + 5000 && lastStart > 0) {
+      html += '<hr class="break" />\n';
+    }
+    lastStart = item.start;
+
+    const mainClean = cleanSubtitleText(item.mainText);
+    const subClean = item.subTexts && item.subTexts.length > 0
+      ? cleanSubtitleText(item.subTexts.join(' '))
+      : '';
+
+    if (mainClean) {
+      const ccClass = isSoundDescription(mainClean) ? ' cc' : '';
+      html += `<div class="main${ccClass}">${escapeHTML(mainClean)}</div>\n`;
+    }
+    if (subClean) {
+      const ccClass = isSoundDescription(subClean) ? ' cc' : '';
+      html += `<div class="sub${ccClass}">${escapeHTML(subClean)}</div>\n`;
+    }
   }
+  html += '</div>\n';
 
   return html;
 }
 
 function escapeHTML(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function escapeXML(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
 // ========== EPUB3 Generator ==========
@@ -163,15 +255,55 @@ function generateEPUB(title, chapters, coverData) {
   </rootfiles>
 </container>`);
 
-  // 3. Stylesheet
+  // 3. Stylesheet (Theme-friendly, supports Light, Dark, and Sepia modes in all readers)
   zip.file('OEBPS/stylesheet.css',
-`body { font-family: Georgia, serif; margin: 1em; line-height: 1.6; }
-h1 { text-align: center; margin-top: 2em; page-break-before: always; }
-h3 { margin: 0.3em 0; }
-.sub { font-size: 60%; color: gray; margin-top: 0.2em; margin-left: 1.0em; margin-bottom: 1.5em; }
-.cc { font-size: 70%; }
-.cover-page { text-align: center; page-break-after: always; }
-.cover-page img { max-width: 100%; max-height: 100%; }`);
+`body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Georgia, serif;
+  margin: 1.2em;
+  line-height: 1.6;
+}
+h1 {
+  text-align: center;
+  margin-top: 1.5em;
+  margin-bottom: 1.2em;
+}
+.main {
+  font-size: 1.05em;
+  margin-top: 0.7em;
+  margin-bottom: 0.2em;
+}
+.single .main {
+  font-weight: normal;
+  line-height: 1.5;
+}
+.dual .main {
+  font-weight: 600;
+}
+.sub {
+  font-size: 0.92em;
+  opacity: 0.75;
+  margin-left: 0.8em;
+  margin-bottom: 1em;
+  font-style: italic;
+}
+.cc {
+  font-style: italic;
+  opacity: 0.7;
+}
+.break {
+  margin: 1.8em auto;
+  width: 40%;
+  border: none;
+  border-top: 1px dashed rgba(128, 128, 128, 0.4);
+}
+.cover-page {
+  text-align: center;
+  page-break-after: always;
+}
+.cover-page img {
+  max-width: 100%;
+  max-height: 100%;
+}`);
 
   // 4. Cover image + cover page
   if (hasCover) {
